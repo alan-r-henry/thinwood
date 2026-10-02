@@ -1,0 +1,10 @@
+{
+  "name": "local-jev-compaction",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Local, free replacement for fast-jev-compaction's TypeSafe/Jev call, using a model running in Ollama instead.",
+  "engines": {
+    "node": ">=18"
+  }
+}
