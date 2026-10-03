@@ -1,11 +1,11 @@
 {
-  "name": "local-jev-compaction",
+  "name": "thinwood",
   "owner": {
     "name": "local"
   },
   "plugins": [
     {
-      "name": "local-jev-compaction",
+      "name": "thinwood",
       "source": "./",
       "description": "Verbatim, locally-scored context compaction for Claude Code, using a model running in Ollama instead of a paid API.",
       "version": "0.1.0",

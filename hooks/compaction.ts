@@ -1,16 +1,15 @@
-// Drop-in replacement for fast-jev-compaction's Claude Code hook
-// (hooks/fast-jev.ts) that scores with a local Ollama model instead of
-// TypeSafe. NOT wired into Claude Code yet: doing so needs the early-access
-// function-hooks flag and a CLI new enough to support it (see README.md).
-//
-// Once those are in place, this file plays the same role as the original
-// repo's hooks/fast-jev.ts and is registered the same way.
+// Compaction hook: scores tool calls with a local Ollama model instead of
+// summarizing (a port of fast-jev-compaction's hooks/fast-jev.ts), and asks
+// for a compaction once the context passes a token or percent threshold.
 
 import { compact, reductionRatio } from '../src/compact.mjs';
 import { ollamaAsker } from '../src/ollama-asker.mjs';
 
+const COOLDOWN_TURNS = 3;
+
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
+  compactAtTokens: 300000,
   minReductionRatio: 0.25,
   model: 'qwen2.5:14b-instruct',
   baseUrl: 'http://localhost:11434',
@@ -41,6 +40,7 @@ export function resolveHookConfig(options) {
   return {
     ...numbers,
     compactAtPercent: optionNumber(options, 'compactAtPercent', HOOK_DEFAULTS.compactAtPercent),
+    compactAtTokens: optionNumber(options, 'compactAtTokens', HOOK_DEFAULTS.compactAtTokens),
     minReductionRatio: optionNumber(options, 'minReductionRatio', HOOK_DEFAULTS.minReductionRatio),
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
     baseUrl: optionString(options, 'baseUrl') ?? HOOK_DEFAULTS.baseUrl,
@@ -95,8 +95,9 @@ function notify($, text) {
 
 export const register = (on, options) => {
   const configured = resolveHookConfig(options);
-  let compacting = false;
-  let proactiveUnavailable = false;
+  let isCompacting = false;
+  let isHeadless = false;
+  let cooldownTurns = 0;
 
   on('session.compact', async ($, event, next) => {
     try {
@@ -110,7 +111,7 @@ export const register = (on, options) => {
       }
       notify(
         $,
-        `local-jev: kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
+        `thinwood: kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
       return { messages };
     } catch (error) {
@@ -120,20 +121,42 @@ export const register = (on, options) => {
   });
 
   on('turn.complete', async ($, event, next) => {
-    if (compacting || proactiveUnavailable) return next(event);
+    if (cooldownTurns > 0) {
+      cooldownTurns--;
+      return next(event);
+    }
+    if (isCompacting) return next(event);
     try {
       const { context } = await $.session.usage();
-      if ((context.percent ?? 0) < configured.compactAtPercent) return next(event);
-      compacting = true;
-      await $.session.compact();
+      const tokens = context.tokens ?? 0;
+      const isOverPercent = (context.percent ?? 0) >= configured.compactAtPercent;
+      const isOverTokens = configured.compactAtTokens > 0 && tokens >= configured.compactAtTokens;
+      if (!isOverPercent && !isOverTokens) return next(event);
+      isCompacting = true;
+      cooldownTurns = COOLDOWN_TURNS;
+      $.ui.log(`context at ${Math.round(tokens / 1000)}k tokens: compacting`);
+      if (!isHeadless) {
+        try {
+          await $.session.compact();
+          return next(event);
+        } catch (error) {
+          if (!/headless/i.test(error instanceof Error ? error.message : String(error))) throw error;
+          isHeadless = true;
+        }
+      }
+      // Headless sessions (-p / SDK, including the Desktop Code tab) can't compact from inside
+      // a hook. Queue /compact for after the turn; it reaches the session.compact hook above.
+      $.clock.after(1500, async () => {
+        try {
+          await $.command.run({ command: 'compact' });
+        } catch (error) {
+          $.ui.log(`auto-compact skipped (${error instanceof Error ? error.message : String(error)})`);
+        }
+      });
     } catch (error) {
-      const message = error instanceof Error ? error.message : String(error);
-      // Headless (-p / SDK, which includes the Desktop Code tab) can't compact from a hook;
-      // the engine's own auto-compact and /compact still reach the session.compact hook above.
-      if (/headless/i.test(message)) proactiveUnavailable = true;
-      else $.ui.log(`auto-compact skipped (${message})`);
+      $.ui.log(`auto-compact skipped (${error instanceof Error ? error.message : String(error)})`);
     } finally {
-      compacting = false;
+      isCompacting = false;
     }
     return next(event);
   });

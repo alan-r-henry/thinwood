@@ -1,5 +1,5 @@
 {
-  "name": "local-jev-compaction",
+  "name": "thinwood",
   "version": "0.1.0",
   "description": "Verbatim, locally-scored context compaction for Claude Code, using a model running in Ollama instead of a paid API.",
   "license": "MIT",
@@ -33,6 +33,36 @@
       "title": "Compaction percentage",
       "description": "Context percentage at which turn.complete requests compaction.",
       "default": 60
+    },
+    "compactAtTokens": {
+      "type": "number",
+      "title": "Compaction token threshold",
+      "description": "Request compaction once the context reaches this many tokens (0 disables). Works in headless/Desktop sessions too. Compaction also triggers at compactAtPercent, whichever comes first.",
+      "default": 300000
+    },
+    "trimResults": {
+      "type": "boolean",
+      "title": "Trim large tool results",
+      "description": "Shrink large tool results (ANSI/progress noise, repeats, a cut middle) before the session keeps them; the full output is saved to ~/.claude/trimmed-results.",
+      "default": true
+    },
+    "trimTools": {
+      "type": "string",
+      "title": "Tools to trim",
+      "description": "Comma-separated tool names whose results may be trimmed. Read and WebFetch are left out by default because exact text matters there.",
+      "default": "Bash,PowerShell,Grep"
+    },
+    "trimThresholdChars": {
+      "type": "number",
+      "title": "Trim threshold (chars)",
+      "description": "Results longer than this are trimmed (errors get three times the allowance).",
+      "default": 4000
+    },
+    "trimVerbose": {
+      "type": "boolean",
+      "title": "Log each trim",
+      "description": "Print a line in the transcript every time a result is trimmed.",
+      "default": false
     },
     "minReductionRatio": {
       "type": "number",
