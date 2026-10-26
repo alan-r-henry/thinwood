@@ -74,19 +74,37 @@
       "type": "number",
       "title": "Maximum state tokens",
       "description": "Estimated token budget for the conversation state sent with every local request.",
-      "default": 25000
+      "default": 8000
     },
     "maxRequestTokens": {
       "type": "number",
       "title": "Maximum request tokens",
       "description": "Estimated token budget for state plus questions in one local request.",
-      "default": 30000
+      "default": 12000
     },
     "truncateHeadChars": {
       "type": "number",
       "title": "Truncated tool result head",
       "description": "Characters of a tool result kept when the model decides its full output is no longer needed.",
       "default": 300
+    },
+    "maxCallsPerRequest": {
+      "type": "number",
+      "title": "Tool calls per request",
+      "description": "Most tool calls scored in one request to the local model. Each is two questions, and a request must finish within the plugin sandbox's 30 s limit.",
+      "default": 20
+    },
+    "minResultChars": {
+      "type": "number",
+      "title": "Smallest result to score",
+      "description": "Tool results shorter than this are kept without asking the model, since dropping them saves almost nothing.",
+      "default": 500
+    },
+    "minScoreSpread": {
+      "type": "number",
+      "title": "Minimum score spread",
+      "description": "If the first request's scores differ by less than this, the model can't tell what to drop and the built-in summary is used right away.",
+      "default": 0.15
     }
   }
 }

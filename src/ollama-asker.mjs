@@ -5,6 +5,12 @@
 
 const DEFAULT_BASE_URL = 'http://localhost:11434';
 const DEFAULT_MODEL = 'qwen2.5:14b-instruct';
+// Ollama's own default window is 4096 tokens, which silently cuts a bigger prompt from the front.
+const DEFAULT_NUM_CTX = 16384;
+// keeps the model loaded between the requests of one compaction (and a little after)
+const DEFAULT_KEEP_ALIVE = '15m';
+// output budget per question, so a rambling model can't run past the sandbox's 30 s request limit
+const OUTPUT_TOKENS_PER_QUESTION = 20;
 
 const SYSTEM_PROMPT = `You are a strict, literal-minded classifier deciding what to keep in a coding \
 assistant's conversation history so it can be safely trimmed to save space. You will receive a \
@@ -51,11 +57,27 @@ export function ollamaAsker(config = {}) {
   const baseUrl = config.baseUrl ?? DEFAULT_BASE_URL;
   const model = config.model ?? DEFAULT_MODEL;
   const fetchFn = config.fetch ?? fetch;
+  const numCtx = config.numCtx ?? DEFAULT_NUM_CTX;
+  const keepAlive = config.keepAlive ?? DEFAULT_KEEP_ALIVE;
 
   return {
+    // Loads the model without answering anything, so the first real request isn't also a cold load.
+    async warm() {
+      const response = await fetchFn(`${baseUrl}/api/generate`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ model, keep_alive: keepAlive }),
+      });
+      if (!response.ok) throw new Error(`Ollama warm-up failed (${response.status})`);
+    },
+
     async ask(state, questions) {
       const questionIds = Object.keys(questions);
-      const userPayload = JSON.stringify({ state, questions });
+      // the model answers under short keys (q1, q2, ...): the real ids are long, and every
+      // output token costs time against the request limit
+      const aliases = questionIds.map((_, index) => `q${index + 1}`);
+      const aliased = Object.fromEntries(questionIds.map((id, index) => [aliases[index], questions[id]]));
+      const userPayload = JSON.stringify({ state, questions: aliased });
 
       const response = await fetchFn(`${baseUrl}/api/chat`, {
         method: 'POST',
@@ -63,8 +85,13 @@ export function ollamaAsker(config = {}) {
         body: JSON.stringify({
           model,
           stream: false,
-          options: { temperature: 0 },
-          format: answersSchema(questionIds),
+          keep_alive: keepAlive,
+          options: {
+            temperature: 0,
+            num_ctx: numCtx,
+            num_predict: aliases.length * OUTPUT_TOKENS_PER_QUESTION + 80,
+          },
+          format: answersSchema(aliases),
           messages: [
             { role: 'system', content: SYSTEM_PROMPT },
             { role: 'user', content: userPayload },
@@ -94,13 +121,15 @@ export function ollamaAsker(config = {}) {
       if (!answers || typeof answers !== 'object') {
         throw new Error('local model response is missing answers');
       }
-      for (const id of questionIds) {
-        const noul = answers[id]?.noul;
+      const byId = {};
+      questionIds.forEach((id, index) => {
+        const noul = answers[aliases[index]]?.noul;
         if (typeof noul !== 'number' || !Number.isFinite(noul) || noul < 0 || noul > 1) {
           throw new Error(`local model gave no valid answer for ${id}`);
         }
-      }
-      return { model, answers };
+        byId[id] = { noul };
+      });
+      return { model, answers: byId };
     },
   };
 }

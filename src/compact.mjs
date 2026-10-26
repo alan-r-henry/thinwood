@@ -9,9 +9,17 @@ export const DEFAULT_OPTIONS = {
   goal: '',
   keepThreshold: 0.5,
   preserveRecentMessages: 6,
-  maxStateTokens: 25_000,
-  maxRequestTokens: 30_000,
+  // sized so one request to a local 14B model (prefill plus a short JSON answer) fits the
+  // plugin sandbox's 30 s limit on a mid-range GPU
+  maxStateTokens: 8_000,
+  maxRequestTokens: 12_000,
   truncateHeadChars: 300,
+  // each call is two questions; more per request means more output tokens to wait for
+  maxCallsPerRequest: 20,
+  // results shorter than this are kept without asking: dropping them saves almost nothing
+  minResultChars: 500,
+  // the first request's scores must span at least this much, or scoring is abandoned
+  minScoreSpread: 0.15,
 };
 
 const REQUEST_OVERHEAD_TOKENS = 20;
@@ -37,6 +45,12 @@ export function resolveOptions(options = {}) {
       0,
       Math.floor(finite(options.truncateHeadChars, DEFAULT_OPTIONS.truncateHeadChars)),
     ),
+    maxCallsPerRequest: Math.max(
+      1,
+      Math.floor(finite(options.maxCallsPerRequest, DEFAULT_OPTIONS.maxCallsPerRequest)),
+    ),
+    minResultChars: Math.max(0, finite(options.minResultChars, DEFAULT_OPTIONS.minResultChars)),
+    minScoreSpread: Math.max(0, finite(options.minScoreSpread, DEFAULT_OPTIONS.minScoreSpread)),
   };
 }
 
@@ -60,7 +74,10 @@ export function batchCalls(calls, stateTokens, options) {
   let currentTokens = 0;
   for (const call of calls) {
     const tokens = estimateTokens(JSON.stringify(questionsFor(call)));
-    if (current.length > 0 && currentTokens + tokens > budget) {
+    if (
+      current.length > 0 &&
+      (currentTokens + tokens > budget || current.length >= (options.maxCallsPerRequest ?? Infinity))
+    ) {
       batches.push(current);
       current = [];
       currentTokens = 0;
@@ -95,6 +112,12 @@ export function decideCall(call, answer, options) {
     return { ...base, action: 'drop_result', reason: 'result_dropped' };
   }
   return { ...base, action: 'drop_call', reason: 'call_dropped' };
+}
+
+function hasSpread(answers, minSpread) {
+  const scores = [...answers.values()].flatMap((a) => [a.keepCall, a.keepResult]);
+  if (scores.length < 10) return true;
+  return Math.max(...scores) - Math.min(...scores) >= minSpread;
 }
 
 async function askBatch(asker, state, batch) {
@@ -199,7 +222,9 @@ export async function compact(messages, asker, options = {}) {
   const started = Date.now();
   const resolved = resolveOptions(options);
   const calls = collectToolCalls(messages, resolved.preserveRecentMessages);
-  const candidates = calls.filter((call) => !call.pinned);
+  const candidates = calls.filter(
+    (call) => !call.pinned && call.resultChars >= resolved.minResultChars,
+  );
   const charsBefore = messages.reduce((sum, message) => sum + messageChars(message), 0);
 
   let fitted = { tokens: 0, stage: '' };
@@ -209,8 +234,17 @@ export async function compact(messages, asker, options = {}) {
     const state = fitState(messages, calls, resolved);
     fitted = state;
     batches = batchCalls(candidates, state.tokens, resolved);
-    const answered = await Promise.all(batches.map((batch) => askBatch(asker, state.state, batch)));
-    for (const map of answered) for (const [id, answer] of map) answers.set(id, answer);
+    // one request at a time: a local server works through them in turn anyway, and a queued
+    // request would spend its time limit waiting
+    for (const [index, batch] of batches.entries()) {
+      const map = await askBatch(asker, state.state, batch);
+      for (const [id, answer] of map) answers.set(id, answer);
+      // a model that scores every call the same can't tell what to drop; stop after the first
+      // request instead of spending minutes of GPU time to learn the same thing
+      if (index === 0 && !hasSpread(map, resolved.minScoreSpread)) {
+        throw new Error('the local model gave every call nearly the same score, so it cannot tell what to drop');
+      }
+    }
   }
 
   const decisions = calls.map((call) =>

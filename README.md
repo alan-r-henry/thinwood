@@ -32,7 +32,9 @@ Set them with `claude plugin install <plugin> --config key=value` or `/plugin co
 | `keepThreshold` | 0.5 | Minimum probability that a tool call or result is still needed. |
 | `preserveRecentMessages` | 6 | Newest messages that are never touched. |
 | `model`, `baseUrl` | `qwen2.5:14b-instruct`, `http://localhost:11434` | Ollama model and server. |
-| `maxStateTokens`, `maxRequestTokens`, `truncateHeadChars` | 25000, 30000, 300 | Request sizing and how much of a dropped result is kept. |
+| `maxStateTokens`, `maxRequestTokens`, `truncateHeadChars` | 8000, 12000, 300 | Request sizing and how much of a dropped result is kept. Sized so one request to a 14B model finishes inside the plugin sandbox's 30 s limit; Ollama's context window is set to fit (16K). |
+| `maxCallsPerRequest`, `minResultChars` | 20, 500 | Tool calls scored per request (two questions each), and the smallest result worth scoring; shorter results are kept without asking. |
+| `minScoreSpread` | 0.15 | If the first request's scores differ by less than this the model cannot tell what to drop, and the built-in summary runs right away instead of after minutes of scoring. |
 | `trimResults` | true | Turn the trimmer on or off. |
 | `trimTools` | `Bash,PowerShell,Grep` | Tools whose results may be trimmed. |
 | `trimThresholdChars` | 4000 | Results longer than this are trimmed (errors get three times the allowance). |
@@ -47,6 +49,8 @@ After every turn the hook reads the context size. Past a threshold it logs one l
 - A three-turn cooldown stops a window that cannot get below the threshold from compacting every turn.
 
 If Ollama is unreachable, returns bad output, or finds too little to prune, the hook hands control back and the built-in summary runs, so a failure never breaks a session.
+
+**Keep the model files on a fast disk.** A request that takes longer than 30 s is aborted, and an aborted model load is cancelled, not finished in the background. A 14B model loaded from a USB hard disk took ~100 s (about 12 s from an NVMe SSD), so every compaction fell back. The hook loads the model in a request of its own just before scoring, and again once the context passes 75% of a trigger, so the model is already in memory when it is needed. Requests go one at a time, because Ollama answers them one at a time and a queued request would spend its 30 s waiting.
 
 ## How the trimmer works
 

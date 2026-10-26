@@ -2,10 +2,14 @@
 // summarizing (a port of fast-jev-compaction's hooks/fast-jev.ts), and asks
 // for a compaction once the context passes a token or percent threshold.
 
-import { compact, reductionRatio } from '../src/compact.mjs';
+import { DEFAULT_OPTIONS, compact, reductionRatio } from '../src/compact.mjs';
 import { ollamaAsker } from '../src/ollama-asker.mjs';
 
 const COOLDOWN_TURNS = 3;
+// start loading the model once the context is this close to a compaction trigger, and again
+// after this long, so the model is loaded (the load can take longer than a request may wait)
+const PREWARM_AT = 0.75;
+const PREWARM_EVERY_MS = 10 * 60 * 1000;
 
 const HOOK_DEFAULTS = {
   compactAtPercent: 60,
@@ -33,6 +37,10 @@ export function resolveHookConfig(options) {
     'maxStateTokens',
     'maxRequestTokens',
     'truncateHeadChars',
+    'maxCallsPerRequest',
+    'minResultChars',
+    'minScoreSpread',
+    'numCtx',
   ]) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -65,8 +73,28 @@ function sandboxFetch($) {
   };
 }
 
+// Ollama's own window defaults to 4096 tokens and cuts longer prompts from the front, so give
+// it room for a full request plus its short answer, in the 2048-token steps it allocates.
+function contextWindow(config) {
+  if (typeof config.numCtx === 'number') return config.numCtx;
+  const request = config.maxRequestTokens ?? DEFAULT_OPTIONS.maxRequestTokens;
+  return Math.ceil((request + 2500) / 2048) * 2048;
+}
+
+function makeAsker(config, $) {
+  return ollamaAsker({
+    baseUrl: config.baseUrl,
+    model: config.model,
+    numCtx: contextWindow(config),
+    fetch: sandboxFetch($),
+  });
+}
+
 async function compactSession(messages, config, $) {
-  const asker = ollamaAsker({ baseUrl: config.baseUrl, model: config.model, fetch: sandboxFetch($) });
+  const asker = makeAsker(config, $);
+  // load the model in a request of its own: a cold load plus the first scoring request would
+  // not fit the sandbox's 30 s limit together
+  await asker.warm();
   const result = await compact(messages, asker, config);
   return { result, messages: result.messages };
 }
@@ -98,6 +126,7 @@ export const register = (on, options) => {
   let isCompacting = false;
   let isHeadless = false;
   let cooldownTurns = 0;
+  let lastPrewarm = 0;
 
   on('session.compact', async ($, event, next) => {
     try {
@@ -131,7 +160,23 @@ export const register = (on, options) => {
       const tokens = context.tokens ?? 0;
       const isOverPercent = (context.percent ?? 0) >= configured.compactAtPercent;
       const isOverTokens = configured.compactAtTokens > 0 && tokens >= configured.compactAtTokens;
-      if (!isOverPercent && !isOverTokens) return next(event);
+      if (!isOverPercent && !isOverTokens) {
+        const isNear =
+          (context.percent ?? 0) >= configured.compactAtPercent * PREWARM_AT ||
+          (configured.compactAtTokens > 0 && tokens >= configured.compactAtTokens * PREWARM_AT);
+        if (isNear && Date.now() - lastPrewarm > PREWARM_EVERY_MS) {
+          lastPrewarm = Date.now();
+          // off the turn's path; a failure here only means the compaction warms the model itself
+          $.clock.after(100, async () => {
+            try {
+              await makeAsker(configured, $).warm();
+            } catch (error) {
+              $.ui.log(`thinwood: model warm-up skipped (${error instanceof Error ? error.message : String(error)})`);
+            }
+          });
+        }
+        return next(event);
+      }
       isCompacting = true;
       cooldownTurns = COOLDOWN_TURNS;
       $.ui.log(`context at ${Math.round(tokens / 1000)}k tokens: compacting`);
