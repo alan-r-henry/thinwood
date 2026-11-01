@@ -53,7 +53,7 @@ export function collectToolCalls(messages, preserveRecentMessages) {
         id: `t${calls.length + 1}`,
         tool_use_id: tool.tool_use_id,
         tool: tool.tool,
-        input: tool.input,
+        input: tool.input ?? {},
         callIndex,
         resultIndex: found.index,
         resultChars: found.result.text.length,

@@ -24,6 +24,10 @@ function optionNumber(options, key, fallback) {
   return typeof value === 'number' && Number.isFinite(value) ? value : fallback;
 }
 
+function optionBoolean(options, key, fallback) {
+  return typeof options[key] === 'boolean' ? options[key] : fallback;
+}
+
 function optionString(options, key) {
   const value = options[key];
   return typeof value === 'string' && value.length > 0 ? value : undefined;
@@ -41,6 +45,10 @@ export function resolveHookConfig(options) {
     'minResultChars',
     'minScoreSpread',
     'numCtx',
+    'dropFraction',
+    'minInputChars',
+    'inputDropFraction',
+    'protectRecentMessages',
   ]) {
     const value = options[key];
     if (typeof value === 'number' && Number.isFinite(value)) numbers[key] = value;
@@ -53,6 +61,9 @@ export function resolveHookConfig(options) {
     model: optionString(options, 'model') ?? HOOK_DEFAULTS.model,
     baseUrl: optionString(options, 'baseUrl') ?? HOOK_DEFAULTS.baseUrl,
     goal: optionString(options, 'goal'),
+    scoring: optionString(options, 'scoring') === 'model' ? 'model' : 'reuse',
+    saveDropped: optionBoolean(options, 'saveDropped', true),
+    pruneBeforeSummary: optionBoolean(options, 'pruneBeforeSummary', true),
   };
 }
 
@@ -90,12 +101,80 @@ function makeAsker(config, $) {
   });
 }
 
-async function compactSession(messages, config, $) {
+async function claudeDirectory($) {
+  const home = (await $.env.get('USERPROFILE')) ?? (await $.env.get('HOME'));
+  return home ? `${home.replace(/\\/g, '/').replace(/\/+$/, '')}/.claude` : undefined;
+}
+
+// The full text of what a compaction cuts is saved here, and each marker names its file.
+async function savedDirectory($) {
+  const claude = await claudeDirectory($);
+  return claude ? `${claude}/thinwood-saved` : undefined;
+}
+
+// One JSON line per compaction decision, newest last, so "is it working?" has an answer
+// (read it with scripts/status.mjs). The sandbox cannot append, so the file is rewritten whole
+// and kept short.
+const LOG_KEEP = 300;
+
+async function record($, entry) {
+  try {
+    const claude = await claudeDirectory($);
+    if (!claude) return;
+    const path = `${claude}/thinwood-log.jsonl`;
+    const lines = (await $.fs.exists(path)) ? (await $.fs.read(path)).split('\n').filter(Boolean) : [];
+    lines.push(JSON.stringify({ at: new Date().toISOString(), ...entry }));
+    await $.fs.write(path, `${lines.slice(-LOG_KEEP).join('\n')}\n`);
+  } catch {
+    // the log is a convenience; never let it break a compaction
+  }
+}
+
+function figures(result) {
+  const { stats } = result;
+  return {
+    messagesBefore: stats.messagesBefore,
+    messagesAfter: stats.messagesAfter,
+    charsBefore: stats.charsBefore,
+    charsAfter: stats.charsAfter,
+    resultsCut: stats.resultsDropped,
+    inputsCut: stats.inputsTruncated,
+    escalations: stats.escalations ?? 0,
+    ms: stats.ms,
+  };
+}
+
+async function writeSaved($, saved) {
+  try {
+    for (let i = 0; i < saved.length; i += 16) {
+      await Promise.all(saved.slice(i, i + 16).map((file) => $.fs.write(file.path, file.text)));
+    }
+    return true;
+  } catch (error) {
+    $.ui.log(`thinwood: could not save what was cut (${error instanceof Error ? error.message : String(error)})`);
+    return false;
+  }
+}
+
+async function compactSession(messages, config, $, directory) {
+  const pathFor = directory
+    ? (kind, id) => `${directory}/${id}-${kind}.${kind === 'input' ? 'json' : 'txt'}`
+    : undefined;
+  if (config.scoring !== 'model') {
+    // scored from how the assistant used each result: no model, no network. Drop more, in steps,
+    // until the minimum reduction is met, so the built-in summary is a last resort.
+    const result = await compact(messages, null, {
+      ...config,
+      targetReduction: config.minReductionRatio,
+      pathFor,
+    });
+    return { result, messages: result.messages };
+  }
   const asker = makeAsker(config, $);
   // load the model in a request of its own: a cold load plus the first scoring request would
   // not fit the sandbox's 30 s limit together
   await asker.warm();
-  const result = await compact(messages, asker, config);
+  const result = await compact(messages, asker, { ...config, pathFor });
   return { result, messages: result.messages };
 }
 
@@ -108,12 +187,19 @@ export function summarize(result) {
   const parts = [
     stats.kept > 0 ? `${stats.kept} kept` : '',
     stats.resultsDropped > 0 ? `${stats.resultsDropped} results truncated` : '',
+    stats.inputsTruncated > 0 ? `${stats.inputsTruncated} inputs truncated` : '',
     stats.callsDropped > 0 ? `${stats.callsDropped} call_dropped` : '',
     stats.pinned > 0 ? `${stats.pinned} pinned` : '',
   ].filter(Boolean);
-  return `${percent(reductionRatio(result))} reduction; ${
+  // about four characters to a token
+  const freedTokens = Math.max(0, Math.round((stats.charsBefore - stats.charsAfter) / 4000));
+  return `${percent(reductionRatio(result))} reduction (~${freedTokens}k tokens); ${
     parts.join(', ') || 'no tool calls'
-  }; state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`;
+  }; ${
+    stats.stateStage === 'reuse'
+      ? 'scored by how each result was used'
+      : `state ~${stats.stateTokens} tokens (${stats.stateStage}) in ${stats.requests} request(s)`
+  }`;
 }
 
 function notify($, text) {
@@ -130,21 +216,44 @@ export const register = (on, options) => {
 
   on('session.compact', async ($, event, next) => {
     try {
-      const { result, messages } = await compactSession(event.messages, configured, $);
+      if (!Array.isArray(event.messages) || event.messages.length === 0) return next(event);
+      const directory = configured.saveDropped ? await savedDirectory($) : undefined;
+      let attempt = await compactSession(event.messages, configured, $, directory);
+      if (
+        reductionRatio(attempt.result) >= configured.minReductionRatio &&
+        attempt.result.saved.length > 0 &&
+        !(await writeSaved($, attempt.result.saved))
+      ) {
+        // markers must not name files that were never written
+        attempt = await compactSession(event.messages, configured, $, undefined);
+      }
+      const { result, messages } = attempt;
       if (reductionRatio(result) < configured.minReductionRatio) {
         notify(
           $,
           `fallback to built-in summary (below ${percent(configured.minReductionRatio)} minimum: ${summarize(result)})`,
         );
+        await record($, { event: 'fallback', reason: 'below minimum', ...figures(result) });
+        // the summary has less to read when what could be cut already is cut
+        if (configured.pruneBeforeSummary && reductionRatio(result) > 0) {
+          let pruned = messages;
+          if (attempt.result.saved.length > 0 && !(await writeSaved($, attempt.result.saved))) {
+            pruned = (await compactSession(event.messages, configured, $, undefined)).messages;
+          }
+          return next({ ...event, messages: pruned });
+        }
         return next(event);
       }
       notify(
         $,
         `thinwood: kept ${messages.length}/${event.messages.length} messages, no summary (${summarize(result)})`,
       );
+      await record($, { event: 'compacted', ...figures(result) });
       return { messages };
     } catch (error) {
-      notify($, `fallback to built-in summary (${error instanceof Error ? error.message : String(error)})`);
+      const reason = error instanceof Error ? error.message : String(error);
+      notify($, `fallback to built-in summary (${reason})`);
+      await record($, { event: 'fallback', reason });
       return next(event);
     }
   });
@@ -162,8 +271,9 @@ export const register = (on, options) => {
       const isOverTokens = configured.compactAtTokens > 0 && tokens >= configured.compactAtTokens;
       if (!isOverPercent && !isOverTokens) {
         const isNear =
-          (context.percent ?? 0) >= configured.compactAtPercent * PREWARM_AT ||
-          (configured.compactAtTokens > 0 && tokens >= configured.compactAtTokens * PREWARM_AT);
+          configured.scoring === 'model' &&
+          ((context.percent ?? 0) >= configured.compactAtPercent * PREWARM_AT ||
+            (configured.compactAtTokens > 0 && tokens >= configured.compactAtTokens * PREWARM_AT));
         if (isNear && Date.now() - lastPrewarm > PREWARM_EVERY_MS) {
           lastPrewarm = Date.now();
           // off the turn's path; a failure here only means the compaction warms the model itself
@@ -180,6 +290,7 @@ export const register = (on, options) => {
       isCompacting = true;
       cooldownTurns = COOLDOWN_TURNS;
       $.ui.log(`context at ${Math.round(tokens / 1000)}k tokens: compacting`);
+      await record($, { event: 'trigger', tokens, percent: context.percent ?? 0 });
       if (!isHeadless) {
         try {
           await $.session.compact();

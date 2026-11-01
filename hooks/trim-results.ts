@@ -62,7 +62,7 @@ export const register = (on, options) => {
           content.push(block);
           continue;
         }
-        if (result.droppedLines > 0) {
+        if (result.lossy) {
           if (!savedTo) {
             content.push(block);
             continue;

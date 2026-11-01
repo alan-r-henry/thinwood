@@ -1,6 +1,6 @@
 {
   "name": "thinwood",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Verbatim, locally-scored context compaction for Claude Code, using a model running in Ollama instead of a paid API.",
   "license": "MIT",
   "userConfig": {
@@ -105,6 +105,48 @@
       "title": "Minimum score spread",
       "description": "If the first request's scores differ by less than this, the model can't tell what to drop and the built-in summary is used right away.",
       "default": 0.15
+    },
+    "scoring": {
+      "type": "string",
+      "title": "Scoring method",
+      "description": "'reuse' (default) ranks old tool results by how the assistant has used them: instant, no model, no network. 'model' asks the local Ollama model about every call (slow; a 14B model scored nearly everything the same).",
+      "default": "reuse"
+    },
+    "dropFraction": {
+      "type": "number",
+      "title": "Share of old results to drop",
+      "description": "With 'reuse': the share of old tool-result text to truncate, 0 to 1. Higher frees more but drops results the assistant may still want (about 8% of later-reused results lost at 0.5, about 25% at 0.7 in the author's tests).",
+      "default": 0.5
+    },
+    "minInputChars": {
+      "type": "number",
+      "title": "Long input threshold (chars)",
+      "description": "A string field in an old tool call's input (a Write body, an Edit's text, a long command) is cut once it is at least this long.",
+      "default": 1500
+    },
+    "inputDropFraction": {
+      "type": "number",
+      "title": "Share of long inputs to cut",
+      "description": "0 to 1. The oldest long inputs are cut first until this share of their text is gone; 0 keeps every input.",
+      "default": 0.7
+    },
+    "saveDropped": {
+      "type": "boolean",
+      "title": "Save what compaction cuts",
+      "description": "Write the full text of every truncated result and input under ~/.claude/thinwood-saved and name the file in the marker, so nothing is lost.",
+      "default": true
+    },
+    "pruneBeforeSummary": {
+      "type": "boolean",
+      "title": "Prune before the built-in summary",
+      "description": "When too little can be cut to skip the summary, still hand the summary the pruned history so it has less to read.",
+      "default": true
+    },
+    "protectRecentMessages": {
+      "type": "number",
+      "title": "Recent messages never cut",
+      "description": "Tool results in this many of the latest messages are never truncated by the reuse scorer.",
+      "default": 24
     }
   }
 }

@@ -10,6 +10,9 @@ export const TRIM_DEFAULTS = {
   tailChars: 1500,
   maxSignalLines: 25,
   errorMultiplier: 3,
+  // a single line longer than this (minified JSON, base64, a one-line log) keeps its start only
+  maxLineChars: 1200,
+  lineHeadChars: 800,
 };
 
 function dropProgressAndAnsi(text) {
@@ -36,6 +39,16 @@ function collapseRepeats(lines) {
   return out;
 }
 
+function clipLongLines(lines, maxChars, headChars) {
+  let clipped = 0;
+  const out = lines.map((line) => {
+    if (line.length <= maxChars) return line;
+    clipped++;
+    return `${line.slice(0, headChars)}[… ${line.length - headChars} more chars on this line]`;
+  });
+  return { lines: out, clipped };
+}
+
 function takeFromStart(lines, budget) {
   let used = 0;
   let n = 0;
@@ -54,33 +67,41 @@ function takeFromEnd(lines, budget, floor) {
 }
 
 /**
- * Returns { text, changed, droppedChars, droppedLines }.
+ * Returns { text, changed, lossy, droppedChars, droppedLines }.
  * Results at or under the threshold come back untouched. Errors get a larger
- * allowance before anything is cut.
+ * allowance before anything is cut. `lossy` means text beyond ANSI codes and
+ * repeated lines was cut, so the caller should save the original.
  */
 export function trimText(original, options = {}, { isError = false, savedTo } = {}) {
   const o = { ...TRIM_DEFAULTS, ...options };
   const limit = isError ? o.thresholdChars * o.errorMultiplier : o.thresholdChars;
-  if (original.length <= limit) return { text: original, changed: false, droppedChars: 0, droppedLines: 0 };
+  const untouched = { text: original, changed: false, lossy: false, droppedChars: 0, droppedLines: 0 };
+  if (original.length <= limit) return untouched;
 
-  const lines = collapseRepeats(dropProgressAndAnsi(original).split('\n'));
-  const cleaned = lines.join('\n');
-  if (cleaned.length <= limit) {
-    return { text: cleaned, changed: cleaned.length < original.length, droppedChars: original.length - cleaned.length, droppedLines: 0 };
-  }
+  const where = savedTo ? `; full output saved to ${savedTo}` : '';
+  const folded = collapseRepeats(dropProgressAndAnsi(original).split('\n'));
+  const { lines, clipped } = clipLongLines(folded, o.maxLineChars, o.lineHeadChars);
+  const note = clipped > 0 ? `\n[thinwood: ${clipped} long line(s) clipped${where}]` : '';
+  const cleaned = lines.join('\n') + note;
+  const finish = (text, droppedLines) => ({
+    text,
+    changed: text.length < original.length,
+    lossy: clipped > 0 || droppedLines > 0,
+    droppedChars: Math.max(0, original.length - text.length),
+    droppedLines,
+  });
+  if (cleaned.length <= limit) return finish(cleaned, 0);
 
   const headN = takeFromStart(lines, o.headChars);
   const tailN = takeFromEnd(lines, o.tailChars, headN);
   const middle = lines.slice(headN, lines.length - tailN);
-  if (middle.length === 0) return { text: cleaned, changed: cleaned.length < original.length, droppedChars: original.length - cleaned.length, droppedLines: 0 };
+  if (middle.length === 0) return finish(cleaned, 0);
 
   const signal = middle.filter((l) => SIGNAL.test(l)).slice(0, o.maxSignalLines).map((l) => (l.length > 240 ? `${l.slice(0, 237)}...` : l));
   const droppedChars = middle.reduce((s, l) => s + l.length + 1, 0);
-  const where = savedTo ? `; full output saved to ${savedTo}` : '';
   const parts = [lines.slice(0, headN).join('\n')];
   parts.push(`[… ${middle.length} lines / ${droppedChars} chars trimmed${where} …]`);
   if (signal.length) parts.push(`[error/warning lines from the trimmed part:]`, ...signal, `[… end of extracted lines …]`);
   parts.push(lines.slice(lines.length - tailN).join('\n'));
-  const text = parts.join('\n');
-  return { text, changed: true, droppedChars: Math.max(0, original.length - text.length), droppedLines: middle.length };
+  return finish(parts.join('\n'), middle.length);
 }

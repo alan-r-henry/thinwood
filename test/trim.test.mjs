@@ -52,3 +52,28 @@ test('error results get three times the allowance before anything is cut', () =>
   assert.equal(trimText(text, opts, { isError: false, savedTo: 'p' }).changed, true);
   assert.equal(trimText(text, opts, { isError: true, savedTo: 'p' }).changed, false);
 });
+
+test('one huge line keeps its start instead of vanishing', () => {
+  const text = `{"data":"${'abc'.repeat(20000)}"}`;
+  const r = trimText(text, opts, { savedTo: 'C:/tmp/full.txt' });
+  assert.equal(r.changed, true);
+  assert.equal(r.lossy, true);
+  assert.ok(r.text.startsWith('{"data":"abcabc'));
+  assert.ok(r.text.length < 2000);
+  assert.match(r.text, /1 long line\(s\) clipped; full output saved to C:\/tmp\/full\.txt/);
+});
+
+test('long lines among many short ones are clipped and the rest is trimmed as before', () => {
+  const lines = numbered(300).split('\n');
+  lines[10] = 'z'.repeat(9000);
+  const r = trimText(lines.join('\n'), opts, { savedTo: 'p' });
+  assert.ok(r.lossy);
+  assert.ok(!r.text.includes('z'.repeat(2000)));
+  assert.match(r.text, /lines \/ \d+ chars trimmed/);
+});
+
+test('folding repeated lines alone is not lossy', () => {
+  const r = trimText(`${'same line here\n'.repeat(600)}end`, opts);
+  assert.equal(r.changed, true);
+  assert.equal(r.lossy, false);
+});
